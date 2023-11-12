@@ -1,12 +1,21 @@
 import torch
 from torch import nn
+from torch.autograd import Variable
+import torch.nn.functional as F
 
+import math
+import copy
+
+c = copy.deepcopy
+
+def clones(module, n):
+    return nn.ModuleList([c(module) for _ in range(n)])
 
 class convBlock(nn.Module):
-    def __init__(self, input_channel, output_channel, stride=1, padding=0):
+    def __init__(self, input_channel, output_channel, stride=1, padding=0,kelnel_size = 3):
         super(convBlock, self).__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels=input_channel, out_channels=output_channel, kernel_size=3, stride=stride,
+            nn.Conv2d(in_channels=input_channel, out_channels=output_channel, kernel_size=kelnel_size, stride=stride,
                       padding=padding),
             nn.BatchNorm2d(output_channel),
             nn.ReLU(inplace=True)
@@ -14,7 +23,6 @@ class convBlock(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
-        # print(x.shape)
         return x
 
 
@@ -66,13 +74,12 @@ class half_unet(nn.Module):
 
         for downsample_layer in self.latter_stages:
             x = downsample_layer(x)
-
         return self.finally_conv(x)
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, hidden_dim, dropout, device=None, max_len=40):
-        super(PositionalEncoding, self).__init__()
+class positionEmbedding(nn.Module):
+    def __init__(self, hidden_dim = 512, dropout=0.1, device=None, max_len=32):
+        super(positionEmbedding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
 
         pe = torch.zeros(max_len, hidden_dim, device=device)
@@ -91,3 +98,133 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         x = x + Variable(self.pe[:, :x.size(1)], requires_grad=False)
         return self.dropout(x)
+
+def attention(query, key, value, mask=None, dropout=None):
+    d_k = query.size(-1)
+
+    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, -1e9)
+
+    p_attn = F.softmax(scores, dim=-1)
+
+    if dropout is not None:
+        p_attn = dropout(p_attn)
+
+    return torch.matmul(p_attn, value), p_attn
+
+class multiHeadAttention(nn.Module):
+    def __init__(self, h, hidden_dim = 512, dropout=0.1):
+        super(multiHeadAttention, self).__init__()
+
+        assert hidden_dim % h == 0
+
+        self.d_k = hidden_dim // h
+
+        self.h = h
+
+        self.linears = clones(nn.Linear(hidden_dim, hidden_dim), 4)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, query, key, value, mask=None):
+        if mask is not None:
+            mask = mask.unsqueeze(1)
+
+        nbatches = query.size(0)
+
+        query, key, value = [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+                             for l, x in zip(self.linears, (query, key, value))]
+
+        x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
+
+        x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
+
+        return self.linears[-1](x)
+
+class layerNorm(nn.Module):
+    def __init__(self, features, eps=1e-6):
+        super(layerNorm, self).__init__()
+
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a_2 * (x - mean) / torch.sqrt(std ** 2 + self.eps) + self.b_2
+
+class sublayerConnection(nn.Module):
+    def __init__(self, size, dropout):
+        super(sublayerConnection, self).__init__()
+        self.norm = layerNorm(size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, sublayer):
+
+        return x + self.dropout(sublayer(self.norm(x)))
+
+class wordEmbedding(nn.Module):
+    def __init__(self, vocab,hidden_size = 512):
+        super(wordEmbedding, self).__init__()
+        self.lut = nn.Embedding(vocab, hidden_size)
+        self.hidden_size = hidden_size
+
+    def forward(self, x):
+
+        return self.lut(x) * math.sqrt(self.hidden_size)
+
+class positionWiseFeedForward(nn.Module):
+    def __init__(self,d_ff = 1024, hidden_dim = 512 , dropout=0.1):
+        super(positionWiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(hidden_dim , d_ff)
+        self.w_2 = nn.Linear(d_ff, hidden_dim )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.w_2(self.dropout(F.relu(self.w_1(x))))
+
+class encoderLayer(nn.Module):
+    def __init__(self, size = 512, h=8, dropout =0.1):
+        super(encoderLayer, self).__init__()
+        # hidden_dim
+        self.size = size
+
+        self.self_attn = multiHeadAttention(h=h,hidden_dim=size)
+        self.feed_forward = positionWiseFeedForward(d_ff=size*2,hidden_dim=size)
+        self.sublayer = clones(sublayerConnection(size, dropout), 2)
+
+    def forward(self, x, mask):
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        return self.sublayer[1](x, self.feed_forward)
+
+class decoderLayer(nn.Module):
+    def __init__(self, h=8, dropout =0.1,size=512):
+        super(decoderLayer, self).__init__()
+        self.size = size
+        self.attn = multiHeadAttention(h=h,hidden_dim=size)
+        self.self_attn = c(self.attn)
+        self.src_attn = c(self.attn)
+        self.feed_forward = positionWiseFeedForward(d_ff=size*2,hidden_dim=size)
+        self.sublayer = clones(sublayerConnection(size, dropout), 3)
+        delattr(self, 'attn')
+
+    def forward(self, x, memory, src_mask, tgt_mask):
+        m = memory
+
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+
+        return self.sublayer[2](x, self.feed_forward)
+
+class generator(nn.Module):
+    def __init__(self, vocab_size,hidden_dim=512):
+        super(generator, self).__init__()
+        self.proj = nn.Linear(hidden_dim, vocab_size)
+
+    def forward(self, x):
+        return F.log_softmax(self.proj(x), dim=-1)
