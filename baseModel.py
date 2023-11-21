@@ -3,6 +3,7 @@ from torch import nn
 from torch.autograd import Variable
 import torch.nn.functional as F
 
+import numpy as np
 import math
 import copy
 
@@ -102,7 +103,7 @@ class positionEmbedding(nn.Module):
 def attention(query, key, value, mask=None, dropout=None):
     d_k = query.size(-1)
 
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+    scores = torch.matmul(query, key.transpose(-2, -1)) / np.sqrt(d_k)
 
     if mask is not None:
         scores = scores.masked_fill(mask == 0, -1e9)
@@ -214,7 +215,6 @@ class decoderLayer(nn.Module):
 
     def forward(self, x, memory, src_mask, tgt_mask):
         m = memory
-
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
 
         x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
@@ -228,3 +228,9 @@ class generator(nn.Module):
 
     def forward(self, x):
         return F.log_softmax(self.proj(x), dim=-1)
+
+if __name__ == '__main__':
+    import torch
+    input = torch.randn([1,1,178,178])
+    model = half_unet(downsample_layers=3)
+    print(model(input).shape)
