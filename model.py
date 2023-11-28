@@ -1,3 +1,4 @@
+import config
 from baseModel import wordEmbedding, decoderLayer, positionEmbedding, clones, half_unet, convBlock, layerNorm, \
     encoderLayer, generator, positionWiseFeedForward
 from torch import nn
@@ -89,8 +90,6 @@ if __name__ == '__main__':
     else:
         device = torch.device("cpu")
 
-    model = featureEmebedding(hidden_dim=256)
-    model.to(device)
-    x = torch.randn(1, 4, 1, 348, 348, device=device)
-    out = model(x)
-    print(out.shape)
+    model = transformer(config.tgt_vocab_size)
+    total_params = sum(p.numel() for p in model.parameters())
+    print("Total number of parameters: ", total_params)
